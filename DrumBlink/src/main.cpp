@@ -3,105 +3,121 @@
 // D9 -> 220Ω -> Red   |  D10 -> 220Ω -> Green  |  D11 -> 220Ω -> Blue
 // Common pin: CC -> GND  |  CA -> +5V
 
-const int PIN_R = 9;
-const int PIN_G = 10;
-const int PIN_B = 11;
+const int PIN_B1 = 2;
+const int PIN_R1 = 3;
+const int PIN_G1 = 4;
+const int PIN_Y = 5;
+const int PIN_W = 6;
+const int PIN_B2 = 7;
+const int PIN_R2 = 8;
+const int PIN_G2 = 9;
 
-// ---- Set your LED type (exactly one true) ----
-const bool COMMON_CATHODE = true;
-const bool COMMON_ANODE = !COMMON_CATHODE;
+const uint8_t LED_PINS[] = {PIN_B1, PIN_R1, PIN_G1, PIN_Y, PIN_W, PIN_B2, PIN_R2, PIN_G2};
+const uint8_t NUM_LEDS = sizeof(LED_PINS) / sizeof(LED_PINS[0]);
 
-// Incoming packet from Python: [0xAA, note, velocity]
 const byte START = 0xAA;
+unsigned long offAt[8] = {0};
 
-// Write color with auto inversion for common-anode
-static inline void setColor(uint8_t r, uint8_t g, uint8_t b)
+// If your wiring is +5V -> resistor -> LED -> pin (sinking current), set true.
+const bool ACTIVE_LOW = true;
+
+// helper to write logical on/off regardless of wiring
+inline void ledWrite(uint8_t pin, bool on)
 {
-  if (COMMON_ANODE)
+  // if ACTIVE_LOW, ON = LOW; if active-high, ON = HIGH
+  digitalWrite(pin, (on ^ ACTIVE_LOW) ? HIGH : LOW);
+}
+
+enum ParseState
+{
+  WAIT,
+  NOTE,
+  VEL
+};
+ParseState st = WAIT;
+uint8_t curNote = 0, curVel = 0;
+
+int8_t noteToPin(uint8_t note)
+{
+  switch (note)
   {
-    r = 255 - r;
-    g = 255 - g;
-    b = 255 - b;
+  case 36:
+    return PIN_W; // Kick
+  case 38:
+  case 40:
+    return PIN_R1; // Snare
+  case 42:
+  case 44:
+  case 46:
+    return PIN_B1; // Hi-hat
+  case 43:
+  case 58:
+    return PIN_G2; // floor tom
+  case 49:
+    return PIN_Y; // Crash
+  case 51:
+    return PIN_R2; // Ride
+  case 48:
+  case 50:
+    return PIN_G1; // Tom 1
+  case 45:
+  case 47:
+    return PIN_B2; // Tom 2
+  default:
+    return -1;
   }
-  analogWrite(PIN_R, r);
-  analogWrite(PIN_G, g);
-  analogWrite(PIN_B, b);
 }
 
-static inline uint8_t v2pwm(uint8_t v)
+void flashPin(uint8_t pin, uint16_t durationMs)
 {
-  // simple linear; tweak as you like
-  unsigned int x = (unsigned int)v * 2;
-  return (x > 255) ? 255 : x;
-}
-
-// Flash color briefly
-unsigned long flashUntil = 0;
-void flashColor(uint8_t r, uint8_t g, uint8_t b, uint16_t ms)
-{
-  setColor(r, g, b);
-  flashUntil = millis() + ms;
+  ledWrite(pin, true);
+  for (uint8_t i = 0; i < NUM_LEDS; ++i)
+  {
+    if (LED_PINS[i] == pin)
+    {
+      offAt[i] = millis() + durationMs;
+      break;
+    }
+  }
 }
 
 void setup()
 {
-  pinMode(PIN_R, OUTPUT);
-  pinMode(PIN_G, OUTPUT);
-  pinMode(PIN_B, OUTPUT);
-  setColor(0, 0, 0);
-
+  for (uint8_t i = 0; i < NUM_LEDS; ++i)
+  {
+    pinMode(LED_PINS[i], OUTPUT);
+    ledWrite(LED_PINS[i], false); // ensure all off at boot
+  }
   Serial.begin(115200);
+}
+
+static inline uint16_t velToMs(uint8_t vel)
+{
+  if (vel == 0)
+    return 0;
+  uint16_t ms = 50 + (uint16_t)vel; // simple, feels snappy
+  if (ms > 160)
+    ms = 160;
+  return ms;
 }
 
 void triggerNote(uint8_t note, uint8_t vel)
 {
   if (vel == 0)
-    return;
-  uint8_t p = v2pwm(vel);
-
-  switch (note)
   {
-  case 36: /* Kick  */
-    flashColor(p, 0, 0, 90);
-    break; // Red
-  case 38: /* Snare */
-    flashColor(0, 0, p, 90);
-    break; // Blue
-  case 42: /* HH cl */
-    flashColor(0, p, 0, 80);
-    break; // Green
-  case 46: /* HH op */
-    flashColor(0, p / 2, p, 100);
-    break; // Cyan
-  case 49: /* Crash */
-    flashColor(p, p, 0, 120);
-    break; // Yellow
-  case 51: /* Ride  */
-    flashColor(p, 0, p, 120);
-    break; // Magenta
-  case 48: /* Tom1  */
-    flashColor(p, p / 3, 0, 100);
-    break; // Orange
-  case 47: /* Tom2  */
-    flashColor(p / 2, 0, p / 2, 100);
-    break; // Purple
-  case 45: /* Tom3  */
-    flashColor(0, p / 2, p / 4, 100);
-    break; // Teal
-  default:
-    flashColor(p / 4, p / 4, p / 4, 70);
-    break; // White-ish
+    return;
   }
+  int8_t pin = noteToPin(note);
+  if (pin < 0)
+  {
+    return; // not mapped
+  }
+  flashPin((uint8_t)pin, velToMs(vel));
 }
 
 void loop()
 {
-  // Parse [START, note, velocity]
-  static enum { WAIT,
-                NOTE,
-                VEL } st = WAIT;
-  static uint8_t note = 0, vel = 0;
-
+  // ---- Parse [START, note, velocity] coming from Python ----
   while (Serial.available())
   {
     uint8_t b = (uint8_t)Serial.read();
@@ -112,21 +128,25 @@ void loop()
         st = NOTE;
       break;
     case NOTE:
-      note = b & 0x7F;
+      curNote = b & 0x7F;
       st = VEL;
       break;
     case VEL:
-      vel = b & 0x7F;
+      curVel = b & 0x7F;
       st = WAIT;
-      triggerNote(note, vel);
+      triggerNote(curNote, curVel);
       break;
     }
   }
 
-  // Auto-off after flash time
-  if (flashUntil && millis() > flashUntil)
+  // ---- Turn off LEDs  ----
+  unsigned long now = millis();
+  for (uint8_t i = 0; i < NUM_LEDS; ++i)
   {
-    setColor(0, 0, 0);
-    flashUntil = 0;
+    if (offAt[i] && now >= offAt[i])
+    {
+      ledWrite(LED_PINS[i], false);
+      offAt[i] = 0;
+    }
   }
 }
