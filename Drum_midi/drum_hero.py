@@ -10,6 +10,78 @@ import simpleaudio as sa
 import mido
 from mido import MidiFile, MetaMessage
 
+# --- NEW: clean Ctrl-C handling ---
+import signal
+STOP = threading.Event()
+def _on_sigint(signum, frame):
+    STOP.set()
+signal.signal(signal.SIGINT, _on_sigint)
+
+# --- NEW: Arduino serial support ---
+import serial
+import serial.tools.list_ports
+from typing import Optional
+
+def find_serial(name_like: Optional[str]) -> Optional[str]:
+    """Return a device path by exact/partial match (e.g., 'usbmodem', 'COM5')."""
+    if not name_like:
+        return None
+    s = name_like.lower()
+    for p in serial.tools.list_ports.comports():
+        desc = (p.description or "")
+        combo = (p.device + " " + desc).lower()
+        if s in combo:
+            return p.device
+    # If user passed a full /dev/ path or COM port, just return it
+    if name_like.startswith("/dev/") or name_like.upper().startswith("COM"):
+        return name_like
+    return None
+
+class ArduinoNotifier:
+    """
+    Sends one byte per grade:
+      'G' -> Perfect   (GREEN)
+      'Y' -> Great/Good (YELLOW)
+      'R' -> Miss      (RED)
+    """
+    def __init__(self, port: Optional[str], baud: int = 115200):
+        self.ser = None
+        if port:
+            try:
+                self.ser = serial.Serial(port, baudrate=baud, timeout=0)
+                # Allow Arduino to reset on port open
+                time.sleep(2.0)
+                print(f"Arduino connected on {port} @ {baud} baud")
+            except Exception as e:
+                print(f"[WARN] Could not open Arduino serial '{port}': {e}")
+
+    def send_grade(self, grade: str):
+        if not self.ser:
+            return
+        try:
+            if grade == "Perfect":
+                self.ser.write(b'G')
+            elif grade in ("Great", "Good"):
+                self.ser.write(b'Y')
+            elif grade == "Miss":
+                self.ser.write(b'R')
+        except Exception as e:
+            print(f"[WARN] Serial write failed: {e}")
+
+    def send_miss_pulse(self):
+        if self.ser:
+            try:
+                self.ser.write(b'R')
+            except:
+                pass
+
+    def close(self):
+        if self.ser:
+            try:
+                self.ser.close()
+            except:
+                pass
+
 # ---------------- Config ----------------
 SR = 44100
 MASTER_GAIN = 0.8
@@ -135,7 +207,7 @@ def grade_for_dt(dt_ms):
     return "Miss"
 
 class Judge:
-    def __init__(self, expected_hits, match_tol_ms=MATCH_TOL_MS):
+    def __init__(self, expected_hits, match_tol_ms=MATCH_TOL_MS, notifier: Optional[ArduinoNotifier]=None):
         self.expected = expected_hits
         self.tol = match_tol_ms/1000.0
         self.lock = threading.Lock()
@@ -146,18 +218,20 @@ class Judge:
         self.max_combo = 0
         self.total = 0
         self.misses = 0
+        self.notifier = notifier
 
     def register_hit(self, t_actual, note, vel):
         kind = GM.get(note)
         if kind not in JUDGED_KINDS:
             return
         with self.lock:
-            # advance cursor to nearby window
+            # advance cursor to nearby window (register silent misses)
             while self.cursor < len(self.expected) and self.expected[self.cursor].t < t_actual - self.tol:
-                # missed note
                 if not self.expected[self.cursor].matched:
                     self.misses += 1
                     self.combo = 0
+                    if self.notifier:
+                        self.notifier.send_miss_pulse()
                 self.cursor += 1
 
             # search a small window around cursor for nearest matching kind
@@ -189,6 +263,10 @@ class Judge:
                 self.combo += 1
                 self.max_combo = max(self.max_combo, self.combo)
 
+            # notify Arduino
+            if self.notifier:
+                self.notifier.send_grade(grade)
+
             result = PerHitScore(kind=e.kind, dt_ms=dt_ms, vel=vel, vel_target=e.vel, grade=grade)
             self.scores.append(result)
             self.per_kind[e.kind].append(result)
@@ -197,11 +275,13 @@ class Judge:
 
     def finalize(self):
         with self.lock:
-            # count remaining misses
+            # count remaining misses (and notify Arduino)
             for i in range(self.cursor, len(self.expected)):
                 if not self.expected[i].matched:
                     self.misses += 1
                     self.combo = 0
+                    if self.notifier:
+                        self.notifier.send_miss_pulse()
 
             acc = sum(1 for s in self.scores if s.grade in ("Perfect","Great","Good"))
             perfects = sum(1 for s in self.scores if s.grade == "Perfect")
@@ -256,10 +336,17 @@ def realtime_runner(expected_hits, tempo_map, play_click=True, midi_out_name=Non
 
     def worker():
         for ev in events:
+            if STOP.is_set():
+                break
             now = time.monotonic()
             delay = ev[1] - now
             if delay > 0:
-                time.sleep(delay)
+                # sleep in small chunks so Ctrl-C remains responsive
+                end_at = now + delay
+                while not STOP.is_set() and time.monotonic() < end_at:
+                    time.sleep(min(0.01, end_at - time.monotonic()))
+            if STOP.is_set():
+                break
             if ev[0] == "click" and play_click:
                 play_mono(CLICK)
             elif ev[0] == "note" and port_out is not None:
@@ -277,8 +364,8 @@ def realtime_runner(expected_hits, tempo_map, play_click=True, midi_out_name=Non
 # -------------- MIDI input listener --------------
 def input_loop(judge: Judge, input_name: str, start_at: float):
     with mido.open_input(input_name) as port:
-        print(f"Listening to: {input_name}")
-        while True:
+        print(f"Listening to: {input_name}  (press Ctrl-C to stop)")
+        while not STOP.is_set():
             for msg in port.iter_pending():
                 if msg.type == 'note_on' and msg.velocity > 0:
                     # use arrival time as performance time
@@ -295,6 +382,9 @@ def main():
     ap.add_argument("--output", help="MIDI output name (e.g., IAC Driver or your module) to play guide notes")
     ap.add_argument("--no-click", action="store_true", help="Disable metronome / count-in click")
     ap.add_argument("--tol", type=int, default=MATCH_TOL_MS, help="Match tolerance in ms (default 120)")
+    # --- NEW: serial args ---
+    ap.add_argument("--serial", help="Arduino serial device or substring (e.g., '/dev/tty.usbmodem1101', 'usbserial', or 'COM5')")
+    ap.add_argument("--baud", type=int, default=115200, help="Arduino baud rate (default 115200)")
     args = ap.parse_args()
 
     # List ports when not specified
@@ -305,16 +395,24 @@ def main():
         print("\nAvailable MIDI outputs:")
         for name in mido.get_output_names():
             print("  -", name)
-        print("\nRe-run with --input 'Your E-Drum Port' [--output 'IAC Driver Bus 1'] to start.")
+        print("\nAvailable Serial ports:")
+        for p in serial.tools.list_ports.comports():
+            print("  -", p.device, "|", p.description)
+        print("\nRe-run with --input 'Your E-Drum Port' [--output 'IAC Driver Bus 1'] [--serial usbmodem].")
         return
+
+    # Resolve serial / open Arduino
+    serial_port = find_serial(args.serial) if args.serial else None
+    notifier = ArduinoNotifier(serial_port, args.baud)
 
     mid = MidiFile(args.midifile)
     expected, tempo_map = extract_chart(mid)
     if not expected:
         print("No drum notes found on channel 10 in this MIDI.")
+        if notifier: notifier.close()
         return
 
-    judge = Judge(expected, match_tol_ms=args.tol)
+    judge = Judge(expected, match_tol_ms=args.tol, notifier=notifier)
 
     # Start playback scheduling
     start_at, play_thread = realtime_runner(
@@ -330,6 +428,7 @@ def main():
         pass
     finally:
         stats = judge.finalize()
+        if notifier: notifier.close()
         print("\n----- Results -----")
         for k, v in stats.items():
             if k == "avg_abs_dt_ms":
