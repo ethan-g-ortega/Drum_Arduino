@@ -3,14 +3,14 @@
 // D9 -> 220Ω -> Red   |  D10 -> 220Ω -> Green  |  D11 -> 220Ω -> Blue
 // Common pin: CC -> GND  |  CA -> +5V
 
-const int PIN_B1 = 2;
-const int PIN_R1 = 3;
-const int PIN_G1 = 4;
-const int PIN_Y = 5;
-const int PIN_W = 6;
-const int PIN_B2 = 7;
-const int PIN_R2 = 8;
-const int PIN_G2 = 9;
+const uint8_t PIN_B1 = 2;
+const uint8_t PIN_R1 = 3;
+const uint8_t PIN_G1 = 4;
+const uint8_t PIN_Y = 5;
+const uint8_t PIN_W = 6;
+const uint8_t PIN_B2 = 7;
+const uint8_t PIN_R2 = 8;
+const uint8_t PIN_G2 = 9;
 
 const uint8_t LED_PINS[] = {PIN_B1, PIN_R1, PIN_G1, PIN_Y, PIN_W, PIN_B2, PIN_R2, PIN_G2};
 const uint8_t NUM_LEDS = sizeof(LED_PINS) / sizeof(LED_PINS[0]);
@@ -18,7 +18,6 @@ const uint8_t NUM_LEDS = sizeof(LED_PINS) / sizeof(LED_PINS[0]);
 const byte START = 0xAA;
 unsigned long offAt[8] = {0};
 
-// If your wiring is +5V -> resistor -> LED -> pin (sinking current), set true.
 const bool ACTIVE_LOW = true;
 
 // helper to write logical on/off regardless of wiring
